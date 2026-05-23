@@ -9,6 +9,13 @@ from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
 
 from .ticktick_client import TickTickClient
+from .cache import task_cache
+from .datetime_utils import (
+    datetime_to_ticktick_format,
+    ticktick_to_human_readable,
+    parse_ticktick_datetime
+)
+from .filters import PropertyFilter, PeriodFilter, TaskFilterer, build_property_filter
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -19,6 +26,34 @@ mcp = FastMCP("ticktick")
 
 # Create TickTick client
 ticktick = None
+
+# Constants
+INBOX_PROJECT_ID = "inbox115795465"
+
+
+def _get_all_projects_including_inbox() -> List[Dict]:
+    """
+    Get all projects including the Inbox project.
+    TickTick API doesn't return Inbox in /project endpoint, so we add it manually.
+    
+    Returns:
+        List of project dictionaries with Inbox prepended
+    """
+    projects = ticktick.get_projects()
+    if 'error' in projects:
+        return projects
+    
+    # Create a virtual Inbox project entry
+    inbox_project = {
+        'id': INBOX_PROJECT_ID,
+        'name': 'Inbox',
+        'color': None,
+        'closed': False,
+        'kind': 'TASK'
+    }
+    
+    # Prepend Inbox to the projects list
+    return [inbox_project] + projects
 
 def initialize_client():
     global ticktick
@@ -35,7 +70,7 @@ def initialize_client():
         ticktick = TickTickClient()
         logger.info("TickTick client initialized successfully")
         
-        # Test API connectivity
+        # Test API connectivity (use direct API call, not the Inbox helper)
         projects = ticktick.get_projects()
         if 'error' in projects:
             logger.error(f"Failed to access TickTick API: {projects['error']}")
@@ -57,11 +92,17 @@ def format_task(task: Dict) -> str:
     # Add project ID
     formatted += f"Project ID: {task.get('projectId', 'None')}\n"
     
-    # Add dates if available
+    # Get the task's timezone (TickTick stores dates in UTC but includes timezone info)
+    task_timezone = task.get('timeZone')
+    
+    # Add dates if available (using human-readable format)
     if task.get('startDate'):
-        formatted += f"Start Date: {task.get('startDate')}\n"
+        start_readable = ticktick_to_human_readable(task.get('startDate'), tz=task_timezone, format_type="datetime")
+        formatted += f"Start Date: {start_readable}\n"
     if task.get('dueDate'):
-        formatted += f"Due Date: {task.get('dueDate')}\n"
+        due_readable = ticktick_to_human_readable(task.get('dueDate'), tz=task_timezone, format_type="datetime")
+        due_relative = ticktick_to_human_readable(task.get('dueDate'), tz=task_timezone, format_type="relative")
+        formatted += f"Due Date: {due_readable} ({due_relative})\n"
     
     # Add priority if available
     priority_map = {0: "None", 1: "Low", 3: "Medium", 5: "High"}
@@ -71,6 +112,11 @@ def format_task(task: Dict) -> str:
     # Add status if available
     status = "Completed" if task.get('status') == 2 else "Active"
     formatted += f"Status: {status}\n"
+    
+    # Add completion time if completed
+    if task.get('status') == 2 and task.get('completedTime'):
+        completed_readable = ticktick_to_human_readable(task.get('completedTime'), tz=task_timezone, format_type="datetime")
+        formatted += f"Completed: {completed_readable}\n"
     
     # Add content if available
     if task.get('content'):
@@ -114,13 +160,14 @@ def format_project(project: Dict) -> str:
 
 @mcp.tool()
 async def get_projects() -> str:
-    """Get all projects from TickTick."""
+    """Get all projects from TickTick, including Inbox."""
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
     
     try:
-        projects = ticktick.get_projects()
+        # Use helper that includes Inbox project
+        projects = _get_all_projects_including_inbox()
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
         
@@ -142,14 +189,15 @@ async def get_project(project_id: str) -> str:
     Get details about a specific project.
     
     Args:
-        project_id: ID of the project
+        project_id: ID of the project (or 'Inbox' for the Inbox project)
     """
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
     
     try:
-        project = ticktick.get_project(project_id)
+        resolved_project_id = _resolve_project_id(project_id)
+        project = ticktick.get_project(resolved_project_id)
         if 'error' in project:
             return f"Error fetching project: {project['error']}"
         
@@ -164,14 +212,15 @@ async def get_project_tasks(project_id: str) -> str:
     Get all tasks in a specific project.
     
     Args:
-        project_id: ID of the project
+        project_id: ID of the project (or 'Inbox' for the Inbox project)
     """
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
     
     try:
-        project_data = ticktick.get_project_with_data(project_id)
+        resolved_project_id = _resolve_project_id(project_id)
+        project_data = ticktick.get_project_with_data(resolved_project_id)
         if 'error' in project_data:
             return f"Error fetching project data: {project_data['error']}"
         
@@ -194,7 +243,7 @@ async def get_task(project_id: str, task_id: str) -> str:
     Get details about a specific task.
     
     Args:
-        project_id: ID of the project
+        project_id: ID of the project (or 'Inbox' for the Inbox project)
         task_id: ID of the task
     """
     if not ticktick:
@@ -202,7 +251,8 @@ async def get_task(project_id: str, task_id: str) -> str:
             return "Failed to initialize TickTick client. Please check your API credentials."
     
     try:
-        task = ticktick.get_task(project_id, task_id)
+        resolved_project_id = _resolve_project_id(project_id)
+        task = ticktick.get_task(resolved_project_id, task_id)
         if 'error' in task:
             return f"Error fetching task: {task['error']}"
         
@@ -225,7 +275,7 @@ async def create_task(
     
     Args:
         title: Task title
-        project_id: ID of the project to add the task to
+        project_id: ID of the project to add the task to (or 'Inbox' for the Inbox project)
         content: Task description/content (optional)
         start_date: Start date in ISO format YYYY-MM-DDThh:mm:ss+0000 (optional)
         due_date: Due date in ISO format YYYY-MM-DDThh:mm:ss+0000 (optional)
@@ -249,9 +299,10 @@ async def create_task(
                 except ValueError:
                     return f"Invalid {date_name} format. Use ISO format: YYYY-MM-DDThh:mm:ss+0000"
         
+        resolved_project_id = _resolve_project_id(project_id)
         task = ticktick.create_task(
             title=title,
-            project_id=project_id,
+            project_id=resolved_project_id,
             content=content,
             start_date=start_date,
             due_date=due_date,
@@ -260,6 +311,12 @@ async def create_task(
         
         if 'error' in task:
             return f"Error creating task: {task['error']}"
+        
+        # Auto-cache the created task
+        task_id = task.get('id')
+        if task_id:
+            task_cache.add_task(task_id, resolved_project_id, title)
+            logger.debug(f"Task {task_id} auto-cached")
         
         return f"Task created successfully:\n\n" + format_task(task)
     except Exception as e:
@@ -281,7 +338,7 @@ async def update_task(
     
     Args:
         task_id: ID of the task to update
-        project_id: ID of the project the task belongs to
+        project_id: ID of the project the task belongs to (or 'Inbox' for the Inbox project)
         title: New task title (optional)
         content: New task description/content (optional)
         start_date: New start date in ISO format YYYY-MM-DDThh:mm:ss+0000 (optional)
@@ -306,9 +363,10 @@ async def update_task(
                 except ValueError:
                     return f"Invalid {date_name} format. Use ISO format: YYYY-MM-DDThh:mm:ss+0000"
         
+        resolved_project_id = _resolve_project_id(project_id)
         task = ticktick.update_task(
             task_id=task_id,
-            project_id=project_id,
+            project_id=resolved_project_id,
             title=title,
             content=content,
             start_date=start_date,
@@ -330,7 +388,7 @@ async def complete_task(project_id: str, task_id: str) -> str:
     Mark a task as complete.
     
     Args:
-        project_id: ID of the project
+        project_id: ID of the project (or 'Inbox' for the Inbox project)
         task_id: ID of the task
     """
     if not ticktick:
@@ -338,7 +396,8 @@ async def complete_task(project_id: str, task_id: str) -> str:
             return "Failed to initialize TickTick client. Please check your API credentials."
     
     try:
-        result = ticktick.complete_task(project_id, task_id)
+        resolved_project_id = _resolve_project_id(project_id)
+        result = ticktick.complete_task(resolved_project_id, task_id)
         if 'error' in result:
             return f"Error completing task: {result['error']}"
         
@@ -353,7 +412,7 @@ async def delete_task(project_id: str, task_id: str) -> str:
     Delete a task.
     
     Args:
-        project_id: ID of the project
+        project_id: ID of the project (or 'Inbox' for the Inbox project)
         task_id: ID of the task
     """
     if not ticktick:
@@ -361,7 +420,8 @@ async def delete_task(project_id: str, task_id: str) -> str:
             return "Failed to initialize TickTick client. Please check your API credentials."
     
     try:
-        result = ticktick.delete_task(project_id, task_id)
+        resolved_project_id = _resolve_project_id(project_id)
+        result = ticktick.delete_task(resolved_project_id, task_id)
         if 'error' in result:
             return f"Error deleting task: {result['error']}"
         
@@ -413,14 +473,15 @@ async def delete_project(project_id: str) -> str:
     Delete a project.
     
     Args:
-        project_id: ID of the project
+        project_id: ID of the project (or 'Inbox' for the Inbox project)
     """
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
     
     try:
-        result = ticktick.delete_project(project_id)
+        resolved_project_id = _resolve_project_id(project_id)
+        result = ticktick.delete_project(resolved_project_id)
         if 'error' in result:
             return f"Error deleting project: {result['error']}"
         
@@ -435,6 +496,21 @@ async def delete_project(project_id: str) -> str:
 # Helper Functions
 
 PRIORITY_MAP = {0: "None", 1: "Low", 3: "Medium", 5: "High"}
+
+def _resolve_project_id(project_id_or_name: str) -> str:
+    """
+    Resolve a project identifier to a project ID.
+    Handles special case for 'Inbox' or 'inbox'.
+    
+    Args:
+        project_id_or_name: Either a project ID or 'Inbox'/'inbox'
+    
+    Returns:
+        The resolved project ID
+    """
+    if project_id_or_name.lower() == "inbox":
+        return INBOX_PROJECT_ID
+    return project_id_or_name
 
 def _is_task_due_today(task: Dict[str, Any]) -> bool:
     """Check if a task is due today."""
@@ -588,7 +664,7 @@ async def get_all_tasks() -> str:
             return "Failed to initialize TickTick client. Please check your API credentials."
     
     try:
-        projects = ticktick.get_projects()
+        projects = _get_all_projects_including_inbox()
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
         
@@ -617,7 +693,7 @@ async def get_tasks_by_priority(priority_id: int) -> str:
         return f"Invalid priority_id. Valid values: {list(PRIORITY_MAP.keys())}"
     
     try:
-        projects = ticktick.get_projects()
+        projects = _get_all_projects_including_inbox()
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
         
@@ -639,7 +715,7 @@ async def get_tasks_due_today() -> str:
             return "Failed to initialize TickTick client. Please check your API credentials."
     
     try:
-        projects = ticktick.get_projects()
+        projects = _get_all_projects_including_inbox()
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
         
@@ -660,7 +736,7 @@ async def get_overdue_tasks() -> str:
             return "Failed to initialize TickTick client. Please check your API credentials."
     
     try:
-        projects = ticktick.get_projects()
+        projects = _get_all_projects_including_inbox()
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
         
@@ -681,7 +757,7 @@ async def get_tasks_due_tomorrow() -> str:
             return "Failed to initialize TickTick client. Please check your API credentials."
     
     try:
-        projects = ticktick.get_projects()
+        projects = _get_all_projects_including_inbox()
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
         
@@ -710,7 +786,7 @@ async def get_tasks_due_in_days(days: int) -> str:
         return "Days must be a non-negative integer."
     
     try:
-        projects = ticktick.get_projects()
+        projects = _get_all_projects_including_inbox()
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
         
@@ -732,7 +808,7 @@ async def get_tasks_due_this_week() -> str:
             return "Failed to initialize TickTick client. Please check your API credentials."
     
     try:
-        projects = ticktick.get_projects()
+        projects = _get_all_projects_including_inbox()
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
         
@@ -771,7 +847,7 @@ async def search_tasks(search_term: str) -> str:
         return "Search term cannot be empty."
     
     try:
-        projects = ticktick.get_projects()
+        projects = _get_all_projects_including_inbox()
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
         
@@ -857,6 +933,10 @@ async def batch_create_tasks(tasks: List[Dict[str, Any]]) -> str:
                     failed_tasks.append(f"Task {i + 1} ('{title}'): {result['error']}")
                 else:
                     created_tasks.append((i + 1, title, result))
+                    # Auto-cache the created task
+                    task_id = result.get('id')
+                    if task_id:
+                        task_cache.add_task(task_id, project_id, title)
                     
             except Exception as e:
                 failed_tasks.append(f"Task {i + 1} ('{task_data.get('title', 'Unknown')}'): {str(e)}")
@@ -896,7 +976,7 @@ async def get_engaged_tasks() -> str:
             return "Failed to initialize TickTick client. Please check your API credentials."
     
     try:
-        projects = ticktick.get_projects()
+        projects = _get_all_projects_including_inbox()
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
         
@@ -923,7 +1003,7 @@ async def get_next_tasks() -> str:
             return "Failed to initialize TickTick client. Please check your API credentials."
     
     try:
-        projects = ticktick.get_projects()
+        projects = _get_all_projects_including_inbox()
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
         
@@ -952,7 +1032,7 @@ async def create_subtask(
     Args:
         subtask_title: Title of the subtask
         parent_task_id: ID of the parent task
-        project_id: ID of the project (must be same for both parent and subtask)
+        project_id: ID of the project (must be same for both parent and subtask) (or 'Inbox' for the Inbox project)
         content: Optional content/description for the subtask
         priority: Priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
     """
@@ -965,10 +1045,11 @@ async def create_subtask(
         return "Invalid priority. Must be 0 (None), 1 (Low), 3 (Medium), or 5 (High)."
     
     try:
+        resolved_project_id = _resolve_project_id(project_id)
         subtask = ticktick.create_subtask(
             subtask_title=subtask_title,
             parent_task_id=parent_task_id,
-            project_id=project_id,
+            project_id=resolved_project_id,
             content=content,
             priority=priority
         )
@@ -980,6 +1061,246 @@ async def create_subtask(
     except Exception as e:
         logger.error(f"Error in create_subtask: {e}")
         return f"Error creating subtask: {str(e)}"
+
+
+# Cache Tools
+
+@mcp.tool()
+async def get_cached_tasks(project_id: str = None, include_stale: bool = False) -> str:
+    """
+    Get tasks from the local cache. Useful for quick lookups without API calls.
+    
+    Args:
+        project_id: Optional project ID to filter by (or 'Inbox' for the Inbox project)
+        include_stale: Whether to include tasks older than 24 hours (default: False)
+    """
+    try:
+        resolved_project_id = None
+        if project_id:
+            resolved_project_id = _resolve_project_id(project_id)
+        
+        cached_tasks = task_cache.get_tasks(
+            project_id=resolved_project_id,
+            include_stale=include_stale
+        )
+        
+        if not cached_tasks:
+            return "No cached tasks found."
+        
+        result = f"Found {len(cached_tasks)} cached tasks:\n\n"
+        for i, task in enumerate(cached_tasks, 1):
+            stale_marker = " (stale)" if task_cache.is_task_stale(task) else ""
+            result += f"{i}. {task.get('title', 'No title')}{stale_marker}\n"
+            result += f"   Task ID: {task.get('task_id')}\n"
+            result += f"   Project ID: {task.get('project_id')}\n"
+            result += f"   Cached: {task.get('cached_at', 'Unknown')}\n\n"
+        
+        return result
+    except Exception as e:
+        logger.error(f"Error in get_cached_tasks: {e}")
+        return f"Error retrieving cached tasks: {str(e)}"
+
+
+@mcp.tool()
+async def register_task_id(task_id: str, project_id: str, title: str) -> str:
+    """
+    Manually register a task ID in the cache. Useful for tasks not created through this server.
+    
+    Args:
+        task_id: TickTick task ID
+        project_id: TickTick project ID (or 'Inbox' for the Inbox project)
+        title: Task title for reference
+    """
+    try:
+        resolved_project_id = _resolve_project_id(project_id)
+        task_cache.add_task(task_id, resolved_project_id, title)
+        return f"Task '{title}' (ID: {task_id}) registered in cache."
+    except Exception as e:
+        logger.error(f"Error in register_task_id: {e}")
+        return f"Error registering task: {str(e)}"
+
+
+@mcp.tool()
+async def clear_task_cache(clear_all: bool = False) -> str:
+    """
+    Clear tasks from the cache.
+    
+    Args:
+        clear_all: If True, clears all tasks. If False, only clears stale tasks (default: False)
+    """
+    try:
+        if clear_all:
+            task_cache.clear_cache()
+            return "All cached tasks have been cleared."
+        else:
+            removed = task_cache.clear_stale_tasks()
+            return f"Removed {removed} stale tasks from cache."
+    except Exception as e:
+        logger.error(f"Error in clear_task_cache: {e}")
+        return f"Error clearing cache: {str(e)}"
+
+
+# DateTime Conversion Tools
+
+@mcp.tool()
+async def convert_datetime_to_ticktick_format(datetime_string: str, timezone: str = None) -> str:
+    """
+    Convert a human-readable datetime to TickTick API format.
+    
+    Args:
+        datetime_string: Date/datetime in ISO format:
+            - Date only: '2024-07-26'
+            - Datetime: '2024-07-26T10:00:00'
+            - With timezone: '2024-07-26T10:00:00+09:00'
+        timezone: IANA timezone name (e.g., 'America/New_York', 'Asia/Seoul').
+            Used if datetime_string doesn't include timezone info.
+    
+    Returns:
+        TickTick format datetime (e.g., '2024-08-15T00:00:00.000+0900')
+    """
+    try:
+        result = datetime_to_ticktick_format(datetime_string, timezone)
+        return f"TickTick format: {result}"
+    except ValueError as e:
+        return f"Error: {str(e)}"
+    except Exception as e:
+        logger.error(f"Error in convert_datetime_to_ticktick_format: {e}")
+        return f"Error converting datetime: {str(e)}"
+
+
+@mcp.tool()
+async def convert_ticktick_to_readable(
+    ticktick_datetime: str, 
+    timezone: str = None, 
+    format_type: str = "datetime"
+) -> str:
+    """
+    Convert a TickTick datetime to human-readable format.
+    
+    Args:
+        ticktick_datetime: TickTick format datetime (e.g., '2024-08-15T00:00:00.000+0900')
+        timezone: Target timezone for display (IANA name, e.g., 'America/Los_Angeles')
+        format_type: Output format:
+            - 'date': 'Aug 15, 2024'
+            - 'datetime': 'Aug 15, 2024 at 10:00 AM'
+            - 'relative': 'Tomorrow', 'In 3 days', '2 days ago'
+    
+    Returns:
+        Human-readable datetime string
+    """
+    try:
+        result = ticktick_to_human_readable(ticktick_datetime, timezone, format_type)
+        return f"Human-readable: {result}"
+    except Exception as e:
+        logger.error(f"Error in convert_ticktick_to_readable: {e}")
+        return f"Error converting datetime: {str(e)}"
+
+
+# Advanced Filtering Tool
+
+@mcp.tool()
+async def filter_tasks(
+    status: str = "uncompleted",
+    project_id: str = None,
+    tag_label: str = None,
+    priority: int = None,
+    start_date: str = None,
+    end_date: str = None,
+    timezone: str = None,
+    sort_by_priority: bool = False
+) -> str:
+    """
+    Advanced task filtering with multiple criteria.
+    
+    Args:
+        status: 'uncompleted' or 'completed' (default: 'uncompleted')
+        project_id: Filter by project ID (or 'Inbox' for the Inbox project)
+        tag_label: Filter by tag name
+        priority: Filter by priority (0=None, 1=Low, 3=Medium, 5=High)
+        start_date: Start of date range (ISO format: YYYY-MM-DD)
+        end_date: End of date range (ISO format: YYYY-MM-DD)
+        timezone: IANA timezone name (e.g., 'America/New_York')
+        sort_by_priority: Sort results by priority, highest first (default: False)
+    
+    Note:
+        - For uncompleted tasks, date filters apply to due dates
+        - For completed tasks, date filters apply to completion dates
+    """
+    if not ticktick:
+        if not initialize_client():
+            return "Failed to initialize TickTick client. Please check your API credentials."
+    
+    try:
+        # Build filter criteria
+        filter_criteria = {
+            'status': status,
+            'project_id': _resolve_project_id(project_id) if project_id else None,
+            'tag_label': tag_label,
+            'priority': priority,
+            'start_date': start_date,
+            'end_date': end_date,
+            'timezone': timezone,
+            'sort_by_priority': sort_by_priority
+        }
+        
+        property_filter, should_sort = build_property_filter(filter_criteria)
+        filterer = TaskFilterer(ticktick)
+        
+        # Collect all tasks from all projects
+        all_tasks = []
+        projects = _get_all_projects_including_inbox()
+        
+        if 'error' in projects:
+            return f"Error fetching projects: {projects['error']}"
+        
+        for project in projects:
+            if project.get('closed'):
+                continue
+            
+            proj_id = project.get('id')
+            
+            # Skip other projects if filtering by specific project
+            if filter_criteria['project_id'] and proj_id != filter_criteria['project_id']:
+                continue
+            
+            project_data = ticktick.get_project_with_data(proj_id)
+            tasks = project_data.get('tasks', [])
+            
+            # Add project name to each task for display
+            for task in tasks:
+                task['_project_name'] = project.get('name', 'Unknown')
+            
+            all_tasks.extend(tasks)
+        
+        # Apply filter
+        filtered_tasks = await filterer.filter(all_tasks, property_filter, should_sort)
+        
+        if not filtered_tasks:
+            return f"No tasks found matching the filter criteria."
+        
+        # Format results
+        result = f"Found {len(filtered_tasks)} tasks matching filter:\n"
+        result += f"Status: {status}"
+        if project_id:
+            result += f", Project: {project_id}"
+        if tag_label:
+            result += f", Tag: {tag_label}"
+        if priority is not None:
+            result += f", Priority: {PRIORITY_MAP.get(priority, priority)}"
+        if start_date or end_date:
+            result += f", Date range: {start_date or 'any'} to {end_date or 'any'}"
+        result += "\n\n"
+        
+        for i, task in enumerate(filtered_tasks, 1):
+            result += f"Task {i} (Project: {task.get('_project_name', 'Unknown')}):\n"
+            result += format_task(task) + "\n"
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error in filter_tasks: {e}")
+        return f"Error filtering tasks: {str(e)}"
+
 
 def main():
     """Main entry point for the MCP server."""

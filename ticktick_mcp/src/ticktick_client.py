@@ -306,3 +306,62 @@ class TickTickClient:
             data["priority"] = priority
             
         return self._make_request("POST", "/task", data)
+    
+    def get_completed_tasks(self, project_id: str, start_date: str = None, end_date: str = None) -> List[Dict]:
+        """
+        Gets completed tasks for a project within an optional date range.
+        
+        Args:
+            project_id: ID of the project
+            start_date: Optional start date for filtering (ISO format)
+            end_date: Optional end date for filtering (ISO format)
+        
+        Returns:
+            List of completed task dictionaries
+        
+        Note:
+            The TickTick Open API may not have a direct endpoint for completed tasks.
+            This method fetches project data and filters for completed tasks (status == 2).
+        """
+        project_data = self.get_project_with_data(project_id)
+        if 'error' in project_data:
+            return project_data
+        
+        tasks = project_data.get('tasks', [])
+        
+        # Filter for completed tasks (status == 2)
+        completed_tasks = [t for t in tasks if t.get('status') == 2]
+        
+        # Optionally filter by completion date
+        if start_date or end_date:
+            filtered_tasks = []
+            for task in completed_tasks:
+                completed_time = task.get('completedTime')
+                if not completed_time:
+                    continue
+                
+                try:
+                    from datetime import datetime
+                    # Parse completion time
+                    comp_dt = datetime.fromisoformat(completed_time.replace("Z", "+00:00"))
+                    comp_date = comp_dt.date()
+                    
+                    # Check date range
+                    if start_date:
+                        start_dt = datetime.fromisoformat(start_date).date()
+                        if comp_date < start_dt:
+                            continue
+                    
+                    if end_date:
+                        end_dt = datetime.fromisoformat(end_date).date()
+                        if comp_date > end_dt:
+                            continue
+                    
+                    filtered_tasks.append(task)
+                except (ValueError, TypeError):
+                    # Include task if date parsing fails
+                    filtered_tasks.append(task)
+            
+            return filtered_tasks
+        
+        return completed_tasks
