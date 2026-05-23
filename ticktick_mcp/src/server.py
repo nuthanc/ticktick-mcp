@@ -3,6 +3,7 @@ import json
 import os
 import logging
 from datetime import datetime, timezone, date, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Dict, List, Any, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -512,43 +513,64 @@ def _resolve_project_id(project_id_or_name: str) -> str:
         return INBOX_PROJECT_ID
     return project_id_or_name
 
-def _is_task_due_today(task: Dict[str, Any]) -> bool:
-    """Check if a task is due today."""
+def _get_task_due_datetime(task: Dict[str, Any]) -> Optional[datetime]:
+    """
+    Parse a task's dueDate and convert it to the task's local timezone.
+
+    TickTick stores dueDate values in UTC (+0000) and records the user's
+    intended timezone separately in the 'timeZone' field (an IANA name such
+    as 'Asia/Kolkata'). Returning a UTC datetime would shift the calendar
+    date for tasks scheduled in the early hours of a UTC+ timezone (e.g.
+    5 AM IST is 11:30 PM UTC the previous day). Converting to the task's
+    local timezone ensures all date comparisons use the correct calendar day.
+
+    Returns:
+        A timezone-aware datetime in the task's local timezone, or None if
+        the dueDate field is absent or cannot be parsed.
+    """
     due_date = task.get('dueDate')
     if not due_date:
-        return False
-    
+        return None
+
     try:
-        task_due_date = datetime.strptime(due_date, "%Y-%m-%dT%H:%M:%S.%f%z").date()
-        today_date = datetime.now(timezone.utc).date()
-        return task_due_date == today_date
+        task_due_dt = datetime.strptime(due_date, "%Y-%m-%dT%H:%M:%S.%f%z")
     except (ValueError, TypeError):
+        return None
+
+    task_tz_name = task.get('timeZone')
+    if task_tz_name:
+        try:
+            task_due_dt = task_due_dt.astimezone(ZoneInfo(task_tz_name))
+        except (ZoneInfoNotFoundError, KeyError):
+            logger.warning("Unknown timeZone '%s' for task '%s'; falling back to UTC.",
+                           task_tz_name, task.get('id', '<unknown>'))
+
+    return task_due_dt
+
+
+def _is_task_due_today(task: Dict[str, Any]) -> bool:
+    """Return True if the task is due on today's date in its local timezone."""
+    task_due_dt = _get_task_due_datetime(task)
+    if task_due_dt is None:
         return False
+    return task_due_dt.date() == datetime.now(task_due_dt.tzinfo).date()
+
 
 def _is_task_overdue(task: Dict[str, Any]) -> bool:
-    """Check if a task is overdue."""
-    due_date = task.get('dueDate')
-    if not due_date:
+    """Return True if the task's due datetime is in the past in its local timezone."""
+    task_due_dt = _get_task_due_datetime(task)
+    if task_due_dt is None:
         return False
-    
-    try:
-        task_due = datetime.strptime(due_date, "%Y-%m-%dT%H:%M:%S.%f%z")
-        return task_due < datetime.now(timezone.utc)
-    except (ValueError, TypeError):
-        return False
+    return task_due_dt < datetime.now(task_due_dt.tzinfo)
+
 
 def _is_task_due_in_days(task: Dict[str, Any], days: int) -> bool:
-    """Check if a task is due in exactly X days."""
-    due_date = task.get('dueDate')
-    if not due_date:
+    """Return True if the task is due exactly *days* days from today in its local timezone."""
+    task_due_dt = _get_task_due_datetime(task)
+    if task_due_dt is None:
         return False
-    
-    try:
-        task_due_date = datetime.strptime(due_date, "%Y-%m-%dT%H:%M:%S.%f%z").date()
-        target_date = (datetime.now(timezone.utc) + timedelta(days=days)).date()
-        return task_due_date == target_date
-    except (ValueError, TypeError):
-        return False
+    target_date = (datetime.now(task_due_dt.tzinfo) + timedelta(days=days)).date()
+    return task_due_dt.date() == target_date
 
 def _task_matches_search(task: Dict[str, Any], search_term: str) -> bool:
     """Check if a task matches the search term (case-insensitive)."""
@@ -813,17 +835,12 @@ async def get_tasks_due_this_week() -> str:
             return f"Error fetching projects: {projects['error']}"
         
         def week_filter(task: Dict[str, Any]) -> bool:
-            due_date = task.get('dueDate')
-            if not due_date:
+            task_due_dt = _get_task_due_datetime(task)
+            if task_due_dt is None:
                 return False
-            
-            try:
-                task_due_date = datetime.strptime(due_date, "%Y-%m-%dT%H:%M:%S.%f%z").date()
-                today = datetime.now(timezone.utc).date()
-                week_from_today = today + timedelta(days=7)
-                return today <= task_due_date <= week_from_today
-            except (ValueError, TypeError):
-                return False
+            today = datetime.now(task_due_dt.tzinfo).date()
+            week_from_today = today + timedelta(days=7)
+            return today <= task_due_dt.date() <= week_from_today
         
         return _get_project_tasks_by_filter(projects, week_filter, "due this week")
         
